@@ -1,0 +1,21 @@
+node_modules/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Generated camera data
+backend/storage/snapshots/*
+backend/storage/clips/*
+
+!backend/storage/snapshots/.gitkeep
+!backend/storage/clips/.gitkeep
+
+# Database
+*.db
+*.db-*
+*.sqlite

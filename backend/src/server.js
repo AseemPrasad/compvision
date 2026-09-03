@@ -1,0 +1,721 @@
+/**
+ * src/server.js
+ *
+ * IBVAP application entrypoint. Wires together:
+ *   CameraManager -> VisionEngine -> SpatialEngine -> AnalyticsEngine -> RiskEngine -> SQLite -> WebSocket
+ *
+ * Exposes:
+ *   - REST API for managing cameras, zones, faces, vehicles, events, alerts
+ *   - WebSocket endpoint (/ws/stream) broadcasting live telemetry and alerts
+ */
+
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import http from 'node:http';
+import { WebSocketServer } from 'ws';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  insertCamera,
+  getCamera,
+  getAllCameras,
+  deleteCamera,
+  updateCameraDetectionParams,
+  insertZone,
+  getZonesForCamera,
+  getAllZones,
+  deleteZone,
+  upsertVehicle,
+  getAllVehicles,
+  upsertFace,
+  getAllFaces,
+  insertEvent,
+  searchEvents,
+  insertAlert,
+  getAllAlerts,
+  acknowledgeAlert,
+} from './database/db.js';
+
+import { CameraManager } from './camera/CameraManager.js';
+import { VisionEngine } from './vision/VisionEngine.js';
+import { SpatialEngine } from './spatial/SpatialEngine.js';
+import { AnalyticsEngine } from './analytics/AnalyticsEngine.js';
+import { normalizePlate } from './analytics/AnprService.js';
+import { RiskEngine } from './risk/RiskEngine.js';
+import { getISTTimestamp, getISTIso, isNightTimeIST } from './utils/timeUtils.js';
+import { FaceService } from './analytics/FaceService.js';
+import { sendUnauthorizedVehicleAlert, sendBoundaryCrossingAlert, verifyMailerConfig } from './notifications/Mailer.js';
+
+// ---------------------------------------------------------------------------
+// App & HTTP/WebSocket bootstrap
+// ---------------------------------------------------------------------------
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '15mb' })); // face/plate enrolment images arrive base64-encoded
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+app.use(express.static(PUBLIC_DIR)); // serves public/viewer.html at "/"
+
+const PORT = Number.parseInt(process.env.PORT ?? '4000', 10);
+const HOST = process.env.HOST ?? '0.0.0.0';
+
+const SNAPSHOT_DIR = process.env.SNAPSHOT_DIR || './storage/snapshots';
+fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws/stream' });
+
+/** Broadcasts a JSON payload to every connected WebSocket client. */
+function broadcast(type, payload) {
+  const message = JSON.stringify({ type, payload, ts: getISTTimestamp() });
+  for (const client of wss.clients) {
+    if (client.readyState === client.OPEN) {
+      client.send(message);
+    }
+  }
+}
+
+wss.on('connection', (ws) => {
+  ws.send(JSON.stringify({
+    type: 'WELCOME',
+    payload: { message: 'Connected to IBVAP live stream', cameras: getAllCameras() },
+    ts: getISTTimestamp(),
+  }));
+
+  ws.on('error', () => {
+    // Ignore — a broken client socket should never affect the server process.
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Core engine instances
+// ---------------------------------------------------------------------------
+
+const cameraManager = new CameraManager();
+const visionEngine = new VisionEngine();
+const spatialEngine = new SpatialEngine();
+const analyticsEngine = new AnalyticsEngine();
+
+let enginesReady = false;
+
+async function initEngines() {
+  try {
+    await visionEngine.init();
+    console.log('[IBVAP] VisionEngine ready (YOLO11 ONNX loaded).');
+  } catch (err) {
+    console.error('[IBVAP] VisionEngine failed to initialize:', err.message);
+    console.error('[IBVAP] Place a valid yolo11n.onnx at', process.env.YOLO_MODEL_PATH || './assets/models/yolo11n.onnx');
+  }
+
+  try {
+    await analyticsEngine.init();
+    console.log('[IBVAP] AnalyticsEngine ready (ANPR + Face models loaded).');
+  } catch (err) {
+    console.error('[IBVAP] AnalyticsEngine failed to initialize:', err.message);
+    console.error('[IBVAP] Ensure face-api models exist at', process.env.FACE_MODELS_PATH || './assets/models/face-api-models');
+  }
+
+  await verifyMailerConfig();
+
+  enginesReady = true;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot persistence helper
+// ---------------------------------------------------------------------------
+
+function saveSnapshot(cameraId, frameBuffer) {
+  const filename = `${cameraId}_${Date.now()}.jpg`;
+  const filePath = path.join(SNAPSHOT_DIR, filename);
+  try {
+    fs.writeFileSync(filePath, frameBuffer);
+    return filePath;
+  } catch (err) {
+    console.error(`[IBVAP] Failed to persist snapshot for ${cameraId}:`, err.message);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Event persistence + alert dispatch helper
+// ---------------------------------------------------------------------------
+
+function recordEvent({ cameraId, trackId, eventType, riskResult, details, frameBuffer }) {
+  const eventId = randomUUID();
+  const timestamp = getISTIso();
+
+  let snapshotPath = null;
+  if (frameBuffer && (riskResult.severity === 'HIGH' || riskResult.severity === 'CRITICAL')) {
+    snapshotPath = saveSnapshot(cameraId, frameBuffer);
+  }
+
+  const event = insertEvent({
+    eventId,
+    cameraId,
+    trackId,
+    eventType,
+    severity: riskResult.severity,
+    riskScore: riskResult.score,
+    details: { ...details, explanation: riskResult.explanation, breakdown: riskResult.breakdown },
+    snapshotPath,
+    timestamp,
+  });
+
+  broadcast('EVENT', event);
+
+  if (riskResult.severity === 'HIGH' || riskResult.severity === 'CRITICAL') {
+    const alertId = randomUUID();
+    const alert = insertAlert({ alertId, eventId });
+    broadcast('ALERT', alert);
+  }
+
+  return event;
+}
+
+// ---------------------------------------------------------------------------
+// Camera pipeline wiring: frame -> vision -> spatial -> analytics -> risk
+// ---------------------------------------------------------------------------
+
+// Cache of the most recent frame buffer per camera, so async spatial/risk
+// event handlers (which fire slightly after the triggering `frame` event)
+// can still attach a snapshot without re-plumbing the buffer through every
+// intermediate emitter.
+const lastFrameByCamera = new Map();
+
+// Throttles live JPEG preview broadcasting independently per camera, since
+// sending a base64 frame on every single tick would flood the WebSocket
+// with far more bandwidth than the live viewer actually needs.
+const FRAME_BROADCAST_INTERVAL = Number.parseInt(process.env.FRAME_BROADCAST_INTERVAL ?? '2', 10);
+const lastBroadcastFrameNumber = new Map();
+
+cameraManager.on('frame', async ({ cameraId, frameBuffer, frameNumber }) => {
+  lastFrameByCamera.set(cameraId, frameBuffer);
+
+  if (!enginesReady || !visionEngine.session) return;
+
+  try {
+    const tracks = await visionEngine.processFrame(cameraId, frameBuffer, frameNumber);
+
+    // Broadcast lightweight live telemetry every frame regardless of
+    // whether anything noteworthy happened, so the UI can render bounding
+    // boxes smoothly.
+    broadcast('TELEMETRY', {
+      cameraId,
+      frameNumber,
+      tracks: tracks.map((t) => ({
+        id: t.id,
+        group: t.group,
+        className: t.className,
+        box: t.box,
+        confidence: t.confidence,
+      })),
+      timestamp: getISTTimestamp(),
+    });
+
+    // Throttled live JPEG preview: only every Nth frame, and only the
+    // actual bytes (already downsampled by CameraManager) base64-encoded
+    // for direct <img>/canvas rendering in the browser viewer.
+    const lastSent = lastBroadcastFrameNumber.get(cameraId) ?? 0;
+    if (frameNumber - lastSent >= FRAME_BROADCAST_INTERVAL) {
+      lastBroadcastFrameNumber.set(cameraId, frameNumber);
+      broadcast('FRAME', {
+        cameraId,
+        frameNumber,
+        jpegBase64: frameBuffer.toString('base64'),
+      });
+    }
+
+    spatialEngine.evaluate(cameraId, tracks);
+
+    if (visionEngine.isAnalyticsFrame(cameraId, frameNumber)) {
+      await analyticsEngine.processFrame(cameraId, frameBuffer, tracks);
+    }
+  } catch (err) {
+    console.error(`[IBVAP] Pipeline error for ${cameraId}:`, err.message);
+  }
+});
+
+cameraManager.on('status', (payload) => broadcast('CAMERA_STATUS', payload));
+cameraManager.on('error', (payload) => console.error(`[IBVAP][${payload.cameraId}] ${payload.message}`));
+cameraManager.on('info', (payload) => console.log(`[IBVAP][${payload.cameraId}] ${payload.message}`));
+
+// --- VisionEngine: animal detection suppresses human-intrusion scoring ---
+visionEngine.on('ANIMAL_DETECTED', (payload) => {
+  const riskResult = RiskEngine.computeRisk({ entityGroup: 'animal' });
+  recordEvent({
+    cameraId: payload.cameraId,
+    trackId: payload.trackId,
+    eventType: 'ANIMAL_DETECTED',
+    riskResult,
+    details: { className: payload.className, box: payload.box },
+    frameBuffer: lastFrameByCamera.get(payload.cameraId),
+  });
+  broadcast('ANIMAL_DETECTED', payload);
+});
+
+visionEngine.on('error', (payload) => console.error(`[IBVAP][Vision][${payload.cameraId ?? '-'}] ${payload.message}`));
+
+// --- SpatialEngine: boundary crossings drive the primary risk pipeline ---
+function handleCrossing(eventType) {
+  return (payload) => {
+    // Class-based routing: animal crossings still get logged (so the
+    // trajectory is on record), but they're informational only — no
+    // security risk contribution and no alert email, matching the
+    // philosophy already used for ANIMAL_DETECTED elsewhere in the
+    // pipeline. A virtual fence along a riverbank will see plenty of
+    // wildlife; treating every one as a security event would drown out
+    // real crossings.
+    const riskResult = RiskEngine.computeRisk({
+      entityGroup: payload.group,
+      zoneSeverity: payload.isAnimalEvent ? undefined : payload.zoneSeverity,
+      isNight: isNightTimeIST(),
+      crossingDirection: payload.isAnimalEvent ? undefined : eventType,
+    });
+
+    const frameBuffer = lastFrameByCamera.get(payload.cameraId);
+    let snapshotPath = null;
+    if (!payload.isAnimalEvent && frameBuffer) {
+      snapshotPath = saveSnapshot(payload.cameraId, frameBuffer);
+    }
+
+    recordEvent({
+      cameraId: payload.cameraId,
+      trackId: payload.trackId,
+      eventType: payload.isAnimalEvent ? 'ANIMAL_BOUNDARY_EVENT' : eventType,
+      riskResult,
+      details: {
+        zoneId: payload.zoneId,
+        zoneName: payload.zoneName,
+        previousState: payload.previousState,
+        newState: payload.newState,
+        groundPoint: payload.groundPoint,
+        className: payload.className,
+        isAnimalEvent: payload.isAnimalEvent,
+      },
+      frameBuffer,
+    });
+
+    broadcast(eventType, payload);
+
+    if (!payload.isAnimalEvent) {
+      sendBoundaryCrossingAlert({
+        cameraId: payload.cameraId,
+        trackId: payload.trackId,
+        zoneId: payload.zoneId,
+        zoneName: payload.zoneName,
+        zoneSeverity: payload.zoneSeverity,
+        eventType,
+        className: payload.className,
+        timestamp: payload.timestamp,
+        snapshotPath,
+      }).then((result) => {
+        broadcast('BOUNDARY_ALERT_EMAIL', {
+          cameraId: payload.cameraId,
+          trackId: payload.trackId,
+          zoneId: payload.zoneId,
+          zoneName: payload.zoneName,
+          eventType,
+          emailSent: result.sent,
+          reason: result.reason,
+          timestamp: getISTTimestamp(),
+        });
+      });
+    }
+  };
+}
+
+spatialEngine.on('INBOUND_CROSSING', handleCrossing('INBOUND_CROSSING'));
+spatialEngine.on('OUTBOUND_CROSSING', handleCrossing('OUTBOUND_CROSSING'));
+spatialEngine.on('STATE_TRANSITION', (payload) => broadcast('STATE_TRANSITION', payload));
+
+// --- AnalyticsEngine: vehicle/person identification and loitering ---
+analyticsEngine.on('VEHICLE_CHECKED', (payload) => {
+  if (payload.label === 'UNREADABLE') return; // nothing conclusive to log
+
+  const isArmy = payload.role === 'ARMY';
+
+  const riskResult = RiskEngine.computeRisk({
+    entityGroup: 'vehicle',
+    isNight: isNightTimeIST(),
+    vehicleLabel: payload.label,
+    nonArmyVehicle: !isArmy,
+  });
+
+  const frameBuffer = lastFrameByCamera.get(payload.cameraId);
+
+  // Always keep a snapshot for non-army detections regardless of overall
+  // risk severity — this is the evidence attached to the alert email, and
+  // "was this actually a civilian vehicle" is exactly the kind of question
+  // a human reviewer will want a picture for, even if the combined risk
+  // score didn't happen to cross the HIGH/CRITICAL threshold.
+  let snapshotPath = null;
+  if (!isArmy && frameBuffer) {
+    snapshotPath = saveSnapshot(payload.cameraId, frameBuffer);
+  }
+
+  recordEvent({
+    cameraId: payload.cameraId,
+    trackId: payload.trackId,
+    eventType: payload.label,
+    riskResult,
+    details: {
+      rawText: payload.rawText,
+      normalizedPlate: payload.normalizedPlate,
+      matchedVehicle: payload.match,
+      role: payload.role,
+    },
+    frameBuffer,
+  });
+
+  broadcast('VEHICLE_CHECKED', payload);
+
+  if (!isArmy) {
+    sendUnauthorizedVehicleAlert({
+      cameraId: payload.cameraId,
+      trackId: payload.trackId,
+      plateNumber: payload.normalizedPlate,
+      vehicleType: payload.match?.vehicle_type,
+      role: payload.role || 'UNREGISTERED',
+      matchLabel: payload.label,
+      timestamp: getISTTimestamp(),
+      snapshotPath,
+    }).then((result) => {
+      broadcast('VEHICLE_ALERT_EMAIL', {
+        cameraId: payload.cameraId,
+        trackId: payload.trackId,
+        plateNumber: payload.normalizedPlate,
+        role: payload.role,
+        emailSent: result.sent,
+        reason: result.reason,
+        timestamp: getISTTimestamp(),
+      });
+    });
+  }
+});
+
+analyticsEngine.on('PERSON_IDENTIFIED', (payload) => {
+  const riskResult = RiskEngine.computeRisk({
+    entityGroup: 'person',
+    isNight: payload.isNight,
+    personLabel: payload.label,
+  });
+
+  recordEvent({
+    cameraId: payload.cameraId,
+    trackId: payload.trackId,
+    eventType: payload.label,
+    riskResult,
+    details: { faceBox: payload.box, match: payload.match },
+    frameBuffer: lastFrameByCamera.get(payload.cameraId),
+  });
+
+  broadcast('PERSON_IDENTIFIED', payload);
+});
+
+analyticsEngine.on('LOITERING_DETECTED', (payload) => {
+  const riskResult = RiskEngine.computeRisk({
+    entityGroup: 'person',
+    isNight: isNightTimeIST(),
+    isLoitering: true,
+  });
+
+  recordEvent({
+    cameraId: payload.cameraId,
+    trackId: payload.trackId,
+    eventType: 'LOITERING_DETECTED',
+    riskResult,
+    details: { dwellSeconds: payload.dwellSeconds },
+    frameBuffer: lastFrameByCamera.get(payload.cameraId),
+  });
+
+  broadcast('LOITERING_DETECTED', payload);
+});
+
+analyticsEngine.on('error', (payload) => console.error(`[IBVAP][Analytics][${payload.cameraId ?? '-'}] ${payload.message}`));
+
+// ---------------------------------------------------------------------------
+// REST API: Cameras
+// ---------------------------------------------------------------------------
+
+app.get('/api/cameras', (req, res) => {
+  res.json({ cameras: getAllCameras() });
+});
+
+app.post('/api/cameras', (req, res) => {
+  const {
+    cameraId, name, sourceType, sourceUrl, locationName, loop,
+    confidenceThreshold, iouThreshold, frameStride, analyticsFrameInterval,
+  } = req.body;
+
+  if (!cameraId || !name || !sourceType || !sourceUrl) {
+    return res.status(400).json({ error: 'cameraId, name, sourceType, and sourceUrl are required' });
+  }
+  if (!['RTSP', 'MJPEG', 'MP4', 'HTTP'].includes(sourceType)) {
+    return res.status(400).json({ error: 'sourceType must be one of RTSP, MJPEG, MP4, HTTP' });
+  }
+  if (getCamera(cameraId)) {
+    return res.status(409).json({ error: `Camera ${cameraId} already exists` });
+  }
+
+  const camera = insertCamera({
+    cameraId, name, sourceType, sourceUrl, locationName, status: 'OFFLINE',
+    confidenceThreshold, iouThreshold, frameStride, analyticsFrameInterval,
+  });
+
+  visionEngine.setCameraConfig(cameraId, { confidenceThreshold, iouThreshold, frameStride, analyticsFrameInterval });
+
+  try {
+    cameraManager.addCamera({ cameraId, sourceType, sourceUrl, loop });
+  } catch (err) {
+    return res.status(500).json({ error: `Camera registered but ingestion failed to start: ${err.message}` });
+  }
+
+  res.status(201).json({ camera });
+});
+
+app.patch('/api/cameras/:cameraId/params', (req, res) => {
+  const { cameraId } = req.params;
+  const { confidenceThreshold, iouThreshold, frameStride, analyticsFrameInterval } = req.body;
+
+  if (!getCamera(cameraId)) {
+    return res.status(404).json({ error: `Unknown camera ${cameraId}` });
+  }
+
+  if (confidenceThreshold != null && (confidenceThreshold < 0 || confidenceThreshold > 1)) {
+    return res.status(400).json({ error: 'confidenceThreshold must be between 0 and 1' });
+  }
+  if (iouThreshold != null && (iouThreshold < 0 || iouThreshold > 1)) {
+    return res.status(400).json({ error: 'iouThreshold must be between 0 and 1' });
+  }
+  if (frameStride != null && (!Number.isInteger(frameStride) || frameStride < 1)) {
+    return res.status(400).json({ error: 'frameStride must be a positive integer' });
+  }
+  if (analyticsFrameInterval != null && (!Number.isInteger(analyticsFrameInterval) || analyticsFrameInterval < 1)) {
+    return res.status(400).json({ error: 'analyticsFrameInterval must be a positive integer' });
+  }
+
+  const camera = updateCameraDetectionParams(cameraId, {
+    confidenceThreshold, iouThreshold, frameStride, analyticsFrameInterval,
+  });
+
+  // Applies immediately — no restart needed. The next processed frame for
+  // this camera picks up the new thresholds/stride.
+  visionEngine.setCameraConfig(cameraId, { confidenceThreshold, iouThreshold, frameStride, analyticsFrameInterval });
+
+  broadcast('CAMERA_PARAMS_UPDATED', camera);
+  res.json({ camera });
+});
+
+app.delete('/api/cameras/:cameraId', (req, res) => {
+  const { cameraId } = req.params;
+
+  cameraManager.removeCamera(cameraId); // stops ffmpeg ingestion if running
+  visionEngine.removeCamera(cameraId);
+  spatialEngine.removeCamera(cameraId);
+  analyticsEngine.removeCamera(cameraId);
+
+  const result = deleteCamera(cameraId); // removes the persisted DB row
+  res.json({ removed: result.changes > 0 });
+});
+
+// ---------------------------------------------------------------------------
+// REST API: Zones
+// ---------------------------------------------------------------------------
+
+app.get('/api/zones', (req, res) => {
+  const { cameraId } = req.query;
+  const zones = cameraId ? getZonesForCamera(cameraId) : getAllZones();
+  res.json({ zones });
+});
+
+app.post('/api/zones', (req, res) => {
+  const { cameraId, zoneName, zoneType, coordinates, severity, directionHint } = req.body;
+
+  if (!cameraId || !zoneName || !zoneType || !Array.isArray(coordinates) || coordinates.length < 2) {
+    return res.status(400).json({
+      error: 'cameraId, zoneName, zoneType, and coordinates (array of >=2 [x,y] points) are required',
+    });
+  }
+  if (!getCamera(cameraId)) {
+    return res.status(404).json({ error: `Unknown camera ${cameraId}` });
+  }
+  if (!['POLYGON', 'LINE'].includes(zoneType)) {
+    return res.status(400).json({ error: 'zoneType must be POLYGON or LINE' });
+  }
+  if (zoneType === 'POLYGON' && coordinates.length < 3) {
+    return res.status(400).json({ error: 'POLYGON zones require at least 3 points' });
+  }
+
+  const zone = insertZone({ cameraId, zoneName, zoneType, coordinates, severity, directionHint });
+  spatialEngine.refreshZones(cameraId);
+
+  res.status(201).json({ zone });
+});
+
+app.delete('/api/zones/:id', (req, res) => {
+  const zone = getAllZones().find((z) => z.id === Number.parseInt(req.params.id, 10));
+  const result = deleteZone(req.params.id);
+  if (zone) spatialEngine.refreshZones(zone.camera_id);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------------------------------------------------------------------------
+// REST API: Face profiles
+// ---------------------------------------------------------------------------
+
+const enrolmentFaceService = new FaceService();
+let faceServiceReady = false;
+
+app.get('/api/faces', (req, res) => {
+  const faces = getAllFaces().map(({ embedding_json, embedding, ...rest }) => rest);
+  res.json({ faces });
+});
+
+app.post('/api/faces', async (req, res) => {
+  const { personCode, label, imageBase64, status } = req.body;
+
+  if (!personCode || !label || !imageBase64) {
+    return res.status(400).json({ error: 'personCode, label, and imageBase64 are required' });
+  }
+
+  try {
+    if (!faceServiceReady) {
+      await enrolmentFaceService.init();
+      faceServiceReady = true;
+    }
+    const buffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+    const embedding = await enrolmentFaceService.extractSingleDescriptorForEnrolment(buffer);
+    const face = upsertFace({ personCode, label, embedding, status });
+    const { embedding_json, ...safeFace } = face;
+    res.status(201).json({ face: safeFace });
+  } catch (err) {
+    res.status(422).json({ error: `Face enrolment failed: ${err.message}` });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// REST API: Vehicles
+// ---------------------------------------------------------------------------
+
+app.get('/api/vehicles', (req, res) => {
+  res.json({ vehicles: getAllVehicles() });
+});
+
+app.post('/api/vehicles', (req, res) => {
+  const { plateNumber, vehicleType, label, status, role } = req.body;
+
+  if (!plateNumber) {
+    return res.status(400).json({ error: 'plateNumber is required' });
+  }
+
+  const normalizedPlate = normalizePlate(plateNumber);
+  if (!normalizedPlate) {
+    return res.status(400).json({ error: 'plateNumber could not be normalized to a valid plate string' });
+  }
+
+  if (role && !['ARMY', 'POLICE', 'CIVILIAN', 'UNKNOWN'].includes(role)) {
+    return res.status(400).json({ error: 'role must be one of ARMY, POLICE, CIVILIAN, UNKNOWN' });
+  }
+
+  const vehicle = upsertVehicle({ plateNumber, normalizedPlate, vehicleType, label, status, role });
+  res.status(201).json({ vehicle });
+});
+
+// ---------------------------------------------------------------------------
+// REST API: Events & Alerts
+// ---------------------------------------------------------------------------
+
+app.get('/api/events', (req, res) => {
+  const { cameraId, eventType, severity, from, to, limit, offset } = req.query;
+  const events = searchEvents({
+    cameraId,
+    eventType,
+    severity,
+    from,
+    to,
+    limit: limit ? Number.parseInt(limit, 10) : undefined,
+    offset: offset ? Number.parseInt(offset, 10) : undefined,
+  });
+  res.json({ events });
+});
+
+app.get('/api/alerts', (req, res) => {
+  res.json({ alerts: getAllAlerts() });
+});
+
+app.post('/api/alerts/:id/acknowledge', (req, res) => {
+  const { acknowledgedBy } = req.body;
+  const alert = acknowledgeAlert(req.params.id, acknowledgedBy);
+  if (!alert) {
+    return res.status(404).json({ error: `Alert ${req.params.id} not found` });
+  }
+  broadcast('ALERT_ACKNOWLEDGED', alert);
+  res.json({ alert });
+});
+
+// ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    enginesReady,
+    visionReady: Boolean(visionEngine.session),
+    timestamp: getISTTimestamp(),
+    activeCameras: cameraManager.listCameraIds(),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot sequence
+// ---------------------------------------------------------------------------
+
+async function bootExistingCameras() {
+  const cameras = getAllCameras();
+  for (const camera of cameras) {
+    try {
+      cameraManager.addCamera({
+        cameraId: camera.camera_id,
+        sourceType: camera.source_type,
+        sourceUrl: camera.source_url,
+      });
+      spatialEngine.refreshZones(camera.camera_id);
+      visionEngine.setCameraConfig(camera.camera_id, {
+        confidenceThreshold: camera.confidence_threshold ?? undefined,
+        iouThreshold: camera.iou_threshold ?? undefined,
+        frameStride: camera.frame_stride ?? undefined,
+        analyticsFrameInterval: camera.analytics_frame_interval ?? undefined,
+      });
+    } catch (err) {
+      console.error(`[IBVAP] Failed to resume camera ${camera.camera_id}:`, err.message);
+    }
+  }
+}
+
+async function start() {
+  await initEngines();
+  await bootExistingCameras();
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[IBVAP] Server listening on http://${HOST}:${PORT}`);
+    console.log(`[IBVAP] WebSocket stream available at ws://${HOST}:${PORT}/ws/stream`);
+  });
+}
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[IBVAP] Unhandled rejection (process kept alive):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[IBVAP] Uncaught exception (process kept alive):', err);
+});
+
+start();
+
+export { app, server, cameraManager, visionEngine, spatialEngine, analyticsEngine };

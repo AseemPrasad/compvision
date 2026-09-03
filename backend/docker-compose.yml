@@ -1,0 +1,37 @@
+services:
+  ibvap-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ibvap-backend:latest
+    container_name: ibvap-backend
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+
+    # Non-path settings (thresholds, timezone, night window, etc.) come from
+    # your .env file. Path-related settings are overridden below to match
+    # the container's filesystem layout, regardless of what host-relative
+    # paths your .env happens to have (e.g. "../ai-engine/models/...").
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=/app/data/ibvap.db
+      - SNAPSHOT_DIR=/app/storage/snapshots
+      - CLIP_DIR=/app/storage/clips
+      - YOLO_MODEL_PATH=/app/ai-engine/models/yolo11n.onnx
+      - FACE_MODELS_PATH=/app/ai-engine/models/face-api-models
+
+    volumes:
+      # Models: read-only, swap files on the host without rebuilding the image
+      - ./ai-engine/models:/app/ai-engine/models:ro
+      # Demo videos: read-only, add/replace clips on the host directly
+      - ./assets/demo_videos:/app/assets/demo_videos:ro
+      # Snapshots/clips written at runtime — persisted across container recreation
+      - ibvap-storage:/app/storage
+      # SQLite database — persisted across container recreation
+      - ibvap-data:/app/data
+
+volumes:
+  ibvap-storage:
+  ibvap-data:
