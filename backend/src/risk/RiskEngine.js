@@ -37,6 +37,17 @@ const WEIGHTS = Object.freeze({
   WATCHLIST_PERSON: 35,
 
   LOITERING: 15,
+
+  // Behavioral analytics signals
+  RUNNING: 25,
+  CRAWLING: 30,
+  CLIMBING: 40,
+  CROWD_SURGE: 35,
+  OBJECT_LEFT_BEHIND: 30,
+  SUSPICIOUS_APPEARANCE: 35,
+
+  // Camera tampering signals
+  CAMERA_TAMPER: 50,
 });
 
 const SEVERITY_BANDS = [
@@ -62,6 +73,8 @@ function severityFromScore(score) {
  * @property {boolean} [nonArmyVehicle] - true if the vehicle's registered role is not ARMY, including no registry match at all
  * @property {'AUTHORIZED'|'UNKNOWN_PERSON'|'WATCHLIST_PERSON'} [personLabel]
  * @property {boolean} [isLoitering]
+ * @property {'running'|'crawling'|'climbing'|'crowdSurge'|'objectLeftBehind'|'suspiciousAppearance'} [behavior]
+ * @property {'freeze'|'darkness'|'obstruction'|'brightness'} [tamperType]
  */
 
 export class RiskEngine {
@@ -125,6 +138,26 @@ export class RiskEngine {
 
     if (signals.isLoitering) {
       addContribution('LOITERING', WEIGHTS.LOITERING, 'Prolonged loitering');
+    }
+
+    // Behavioral signals
+    if (signals.behavior === 'running') {
+      addContribution('RUNNING', WEIGHTS.RUNNING, 'Running detected');
+    } else if (signals.behavior === 'crawling') {
+      addContribution('CRAWLING', WEIGHTS.CRAWLING, 'Crawling / crouching detected');
+    } else if (signals.behavior === 'climbing') {
+      addContribution('CLIMBING', WEIGHTS.CLIMBING, 'Climbing attempt detected');
+    } else if (signals.behavior === 'crowdSurge') {
+      addContribution('CROWD_SURGE', WEIGHTS.CROWD_SURGE, 'Abnormal crowd detected');
+    } else if (signals.behavior === 'objectLeftBehind') {
+      addContribution('OBJECT_LEFT_BEHIND', WEIGHTS.OBJECT_LEFT_BEHIND, 'Object left behind');
+    } else if (signals.behavior === 'suspiciousAppearance') {
+      addContribution('SUSPICIOUS_APPEARANCE', WEIGHTS.SUSPICIOUS_APPEARANCE, 'Suspicious appearance in restricted zone');
+    }
+
+    // Camera tampering signals
+    if (signals.tamperType) {
+      addContribution('CAMERA_TAMPER', WEIGHTS.CAMERA_TAMPER, `Camera tampering: ${signals.tamperType}`);
     }
 
     const rawScore = Object.values(breakdown).reduce((sum, v) => sum + v, 0);

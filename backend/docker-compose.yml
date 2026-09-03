@@ -22,6 +22,22 @@ services:
       - YOLO_MODEL_PATH=/app/ai-engine/models/yolo11n.onnx
       - FACE_MODELS_PATH=/app/ai-engine/models/face-api-models
 
+    # Resource constraints
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+    # Health check using the /api/health endpoint
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/api/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
     volumes:
       # Models: read-only, swap files on the host without rebuilding the image
       - ./ai-engine/models:/app/ai-engine/models:ro

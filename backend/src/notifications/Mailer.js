@@ -1,62 +1,63 @@
 /**
  * src/notifications/Mailer.js
  *
- * Sends an email alert to a hardcoded list of recipients — e.g. the unit
- * head, the duty employee, and gate/checkpoint staff — whenever a detected
- * vehicle's registered role is anything other than "ARMY" (including
- * vehicles with no database match at all, UNREGISTERED), or a tracked
- * object crosses a virtual fence line.
+ * Sends email alerts to configured recipients whenever a non-army vehicle is
+ * detected or a boundary crossing occurs. Credentials and recipients are loaded
+ * from environment variables — see .env.example for the full list.
  *
- * ============================================================
- * WHY CREDENTIALS ARE HARDCODED HERE (READ BEFORE DEPLOYING)
- * ============================================================
- * Per project requirements, the SMTP account and alert recipients are
- * hardcoded directly in this file rather than loaded from `.env`. This is
- * simpler for a single-purpose demo/hackathon build, but it means:
- *   - These values WILL be committed to source control if you push this
- *     repo anywhere (GitHub, GitLab, a shared drive, etc.).
- *   - Anyone with read access to this file can see your SMTP password.
- * If this project ever leaves your own machine, either scrub this file
- * from git history and rotate the credentials, or move these constants
- * back into `.env` (the rest of the codebase already follows that pattern
- * everywhere else — see src/server.js for examples).
- *
- * REPLACE THE PLACEHOLDER VALUES BELOW before alerts will actually send.
- * For Gmail specifically: you cannot use your normal account password —
- * you must generate an "App Password" (Google Account -> Security -> 2-Step
- * Verification -> App Passwords) and use that 16-character value instead.
+ * Alert priority levels:
+ *   P0 — Critical: Camera tamper, night breach  → SMS + Email immediately
+ *   P1 — High:     Inbound crossing, unknown vehicle, watchlist → SMS + Email
+ *   P2 — Medium:   Outbound crossing, loitering, crowd surge   → Email only
+ *   P3 — Low:      Animal events, state transitions            → Log only
  */
 
 import nodemailer from 'nodemailer';
 
-// ============================================================
-// HARDCODED CONFIGURATION — EDIT THESE TWO BLOCKS
-// ============================================================
+// ---------------------------------------------------------------------------
+// SMTP Configuration — loaded from environment variables
+// ---------------------------------------------------------------------------
 
-/** Your sending mailbox's SMTP settings and login. */
 const SMTP_CONFIG = {
-  host: 'smtp.gmail.com',       // e.g. smtp.gmail.com, smtp.office365.com, your org's SMTP relay
-  port: 587,                     // 587 = STARTTLS (recommended), 465 = implicit TLS
-  secure: false,                  // true only if port is 465
+  host:     process.env.SMTP_HOST     || 'smtp.gmail.com',
+  port:     Number.parseInt(process.env.SMTP_PORT ?? '587', 10),
+  secure:   process.env.SMTP_SECURE === 'true',
   auth: {
-    user: 'REPLACE_WITH_YOUR_SENDER_EMAIL@gmail.com',
-    pass: 'REPLACE_WITH_YOUR_APP_PASSWORD',
+    user: process.env.SMTP_USER || '',
+    pass: process.env.SMTP_PASS || '',
   },
 };
 
-/** The list of inboxes that receive every alert email — one entry per role. */
 const ALERT_RECIPIENT_EMAILS = [
-  'REPLACE_WITH_HEAD_EMAIL@example.gov.in',       // Officer-in-charge / SSB unit head
-  'REPLACE_WITH_EMPLOYEE_EMAIL@example.gov.in',   // Duty employee / control room operator
-  'REPLACE_WITH_GATEKEEPER_EMAIL@example.gov.in', // Gate/checkpoint staff
-];
+  process.env.ALERT_RECIPIENT_1,
+  process.env.ALERT_RECIPIENT_2,
+  process.env.ALERT_RECIPIENT_3,
+].filter(Boolean);
 
-const ALERT_SENDER_DISPLAY_NAME = 'IBVAP Border Surveillance Alert';
+const ALERT_SENDER_DISPLAY_NAME = process.env.ALERT_SENDER_NAME || 'IBVAP Border Surveillance Alert';
+
+// Alert priority: determines which events warrant immediate SMS + email
+// vs. email-only vs. log-only
+const ALERT_PRIORITY = {
+  P0_CRITICAL: ['CAMERA_TAMPER_FREEZE', 'CAMERA_TAMPER_DARKNESS', 'CAMERA_TAMPER_OBSTRUCTED',
+    'CAMERA_TAMPER_OVEREXPOSURE', 'INBOUND_CROSSING_NIGHT', 'BLACKLISTED_VEHICLE'],
+  P1_HIGH:    ['INBOUND_CROSSING', 'OUTBOUND_CROSSING', 'UNKNOWN_VEHICLE', 'WATCHLIST_PERSON',
+    'RUNNING_DETECTED', 'CLIMBING_DETECTED', 'CROWD_SURGE', 'OBJECT_LEFT_BEHIND',
+    'CRAWLING_DETECTED'],
+  P2_MEDIUM:  ['LOITERING_DETECTED', 'PERSON_IDENTIFIED'],
+};
+
+function getAlertPriority(eventType) {
+  if (ALERT_PRIORITY.P0_CRITICAL.includes(eventType)) return 'P0_CRITICAL';
+  if (ALERT_PRIORITY.P1_HIGH.includes(eventType)) return 'P1_HIGH';
+  if (ALERT_PRIORITY.P2_MEDIUM.includes(eventType)) return 'P2_MEDIUM';
+  return 'P3_LOW';
+}
 
 // Minimum time between repeat alert emails for the *same plate* (or the
 // same camera+track if the plate couldn't be read), so a vehicle idling in
 // frame across many analytics-eligible frames doesn't flood the inbox.
-const ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const ALERT_COOLDOWN_MS = Number.parseInt(process.env.ALERT_EMAIL_COOLDOWN_MS ?? '300000', 10); // default 5 minutes
 
 // ============================================================
 // Implementation — shouldn't need to touch below this line
@@ -208,6 +209,80 @@ export async function sendBoundaryCrossingAlert(details) {
 }
 
 /**
+ * Sends a generic alert email for any event type (behavior, tamper, etc.).
+ * Uses alert priority to determine severity in the subject line.
+ *
+ * @param {object} details
+ * @param {string} details.eventType
+ * @param {string} details.cameraId
+ * @param {string} [details.trackId]
+ * @param {string} details.timestamp
+ * @param {string} [details.zoneName]
+ * @param {string} [details.severity]
+ * @param {string} [details.riskScore]
+ * @param {string} [details.extraInfo] - additional lines for the email body
+ * @param {string|null} [details.snapshotPath]
+ * @returns {Promise<{sent: boolean, reason?: string}>}
+ */
+export async function sendGenericAlert(details) {
+  const cooldownKey = details.eventType
+    ? `${details.eventType}:${details.cameraId}:${details.trackId || 'no-track'}`
+    : `${details.cameraId}:${details.trackId || 'no-track'}`;
+
+  // Tamper events have no cooldown — always send immediately
+  const cooldown = details.eventType?.startsWith('CAMERA_TAMPER') ? 0 : ALERT_COOLDOWN_MS;
+  if (cooldown > 0 && isOnCooldown(cooldownKey)) {
+    return { sent: false, reason: 'cooldown' };
+  }
+
+  const priority = getAlertPriority(details.eventType || '');
+  const priorityLabel = priority.replace('_', ' ');
+
+  const severityIcon = priority === 'P0_CRITICAL' ? '🚨 CRITICAL'
+    : priority === 'P1_HIGH' ? '⚠️ HIGH'
+    : priority === 'P2_MEDIUM' ? '⚡ MEDIUM'
+    : 'ℹ️ LOW';
+
+  const subject = `[IBVAP ${priorityLabel}] ${details.eventType} — ${details.cameraId}`;
+
+  const lines = [
+    `IBVAP Border Surveillance — ${priorityLabel} Alert`,
+    '',
+    `Event:  ${details.eventType}`,
+    `Camera: ${details.cameraId}`,
+    details.trackId ? `Track ID: ${details.trackId}` : null,
+    details.zoneName ? `Zone: ${details.zoneName}` : null,
+    details.severity ? `Severity: ${details.severity}` : null,
+    details.riskScore != null ? `Risk Score: ${details.riskScore}/100` : null,
+    `Timestamp: ${details.timestamp}`,
+    '',
+    ...(details.extraInfo || []),
+  ].filter(Boolean);
+
+  const textBody = lines.join('\n');
+
+  const mailOptions = {
+    from: `"${ALERT_SENDER_DISPLAY_NAME}" <${SMTP_CONFIG.auth.user}>`,
+    to: ALERT_RECIPIENT_EMAILS.join(', '),
+    subject,
+    text: textBody,
+  };
+
+  if (details.snapshotPath) {
+    mailOptions.attachments = [{ filename: 'snapshot.jpg', path: details.snapshotPath }];
+  }
+
+  try {
+    await transporter.sendMail(mailOptions);
+    if (cooldown > 0) lastAlertSentAt.set(cooldownKey, Date.now());
+    return { sent: true };
+  } catch (err) {
+    console.error(`[IBVAP][Mailer] Failed to send generic alert (${details.eventType}):`, err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+/**
  * Verifies the SMTP configuration works at all, without sending a real
  * alert. Useful to call once at server boot so a misconfigured mailbox
  * shows up in the logs immediately rather than silently failing on the
@@ -225,4 +300,4 @@ export async function verifyMailerConfig() {
   }
 }
 
-export default { sendUnauthorizedVehicleAlert, sendBoundaryCrossingAlert, verifyMailerConfig };
+export default { sendUnauthorizedVehicleAlert, sendBoundaryCrossingAlert, sendGenericAlert, verifyMailerConfig };

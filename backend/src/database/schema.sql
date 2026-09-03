@@ -95,6 +95,10 @@ CREATE INDEX IF NOT EXISTS idx_face_registry_status ON face_registry (status);
 -- --------------------------------------------------------------------------
 -- events: every detected/analyzed occurrence emitted by the pipeline
 -- --------------------------------------------------------------------------
+-- Additional columns added by feature expansions:
+--   behavior_type  TEXT  — e.g. RUNNING, CRAWLING, CLIMBING, LOITERING, CROWD_SURGE, OBJECT_LEFT_BEHIND
+--   tamper_type    TEXT  — e.g. CAMERA_FREEZE, CAMERA_DARKNESS, CAMERA_OVEREXPOSURE, CAMERA_OBSTRUCTED
+-- --------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS events (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id       TEXT NOT NULL UNIQUE,          -- UUID
@@ -107,6 +111,8 @@ CREATE TABLE IF NOT EXISTS events (
   snapshot_path  TEXT,
   timestamp      TEXT NOT NULL,                  -- IST ISO timestamp of occurrence
   created_at     TEXT NOT NULL,
+  behavior_type  TEXT,                           -- e.g. RUNNING, CRAWLING, CLIMBING, CROWD_SURGE, OBJECT_LEFT_BEHIND
+  tamper_type    TEXT,                           -- e.g. CAMERA_FREEZE, CAMERA_DARKNESS, CAMERA_OBSTRUCTED
   FOREIGN KEY (camera_id) REFERENCES cameras (camera_id) ON DELETE CASCADE
 );
 

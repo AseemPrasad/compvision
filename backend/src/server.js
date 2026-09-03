@@ -48,7 +48,14 @@ import { normalizePlate } from './analytics/AnprService.js';
 import { RiskEngine } from './risk/RiskEngine.js';
 import { getISTTimestamp, getISTIso, isNightTimeIST } from './utils/timeUtils.js';
 import { FaceService } from './analytics/FaceService.js';
-import { sendUnauthorizedVehicleAlert, sendBoundaryCrossingAlert, verifyMailerConfig } from './notifications/Mailer.js';
+import { sendUnauthorizedVehicleAlert, sendBoundaryCrossingAlert, sendGenericAlert, verifyMailerConfig } from './notifications/Mailer.js';
+import { BehaviorEngine } from './analytics/BehaviorEngine.js';
+import { TamperDetector } from './analytics/TamperDetector.js';
+import { C2Webhook } from './integration/C2Webhook.js';
+import { MQTTAdapter } from './integration/MQTTAdapter.js';
+import { TAKAdapter } from './integration/TAKAdapter.js';
+import { SMSAlert } from './notifications/SMSAlert.js';
+import { RadioAlert } from './notifications/RadioAlert.js';
 
 // ---------------------------------------------------------------------------
 // App & HTTP/WebSocket bootstrap
@@ -57,6 +64,18 @@ import { sendUnauthorizedVehicleAlert, sendBoundaryCrossingAlert, verifyMailerCo
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' })); // face/plate enrolment images arrive base64-encoded
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    if (req.path !== '/api/health') { // don't log health checks
+      console.log(`${req.method.padEnd(7)} ${req.path} ${res.statusCode} ${ms}ms`);
+    }
+  });
+  next();
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -102,6 +121,21 @@ const visionEngine = new VisionEngine();
 const spatialEngine = new SpatialEngine();
 const analyticsEngine = new AnalyticsEngine();
 
+// BehaviorEngine uses spatial zones for crowd / suspicious-appearance detection
+const behaviorEngine = new BehaviorEngine((cameraId) => getZonesForCamera(cameraId));
+
+// Per-camera tamper detectors — one instance per camera
+const tamperDetectors = new Map();
+
+// C2 integration adapters
+const c2Webhook = new C2Webhook();
+const mqttAdapter = new MQTTAdapter();
+const takAdapter = new TAKAdapter();
+
+// Offline alerting
+const smsAlert = new SMSAlert();
+const radioAlert = new RadioAlert();
+
 let enginesReady = false;
 
 async function initEngines() {
@@ -122,6 +156,26 @@ async function initEngines() {
   }
 
   await verifyMailerConfig();
+
+  // Initialize C2 integrations
+  await mqttAdapter.connect();
+
+  // Log C2 status
+  if (c2Webhook['_urls'] && c2Webhook['_urls'].length > 0) {
+    console.log(`[IBVAP] C2Webhook ready — ${c2Webhook['_urls'].length} webhook(s) configured`);
+  }
+  if (mqttAdapter.isEnabled) {
+    console.log(`[IBVAP] MQTTAdapter ready — broker: ${mqttAdapter['_brokerUrl']}`);
+  }
+  if (takAdapter['_enabled']) {
+    console.log(`[IBVAP] TAKAdapter ready — multicasting to ${takAdapter['_multicastAddr']}:${takAdapter['_multicastPort']}`);
+  }
+  if (smsAlert['_phoneNumbers'].length > 0) {
+    console.log(`[IBVAP] SMSAlert ready — ${smsAlert['_phoneNumbers'].length} recipient(s) configured`);
+  }
+  if (radioAlert['_enabled']) {
+    console.log(`[IBVAP] RadioAlert ready — serial port: ${radioAlert['_port']}`);
+  }
 
   enginesReady = true;
 }
@@ -146,7 +200,7 @@ function saveSnapshot(cameraId, frameBuffer) {
 // Event persistence + alert dispatch helper
 // ---------------------------------------------------------------------------
 
-function recordEvent({ cameraId, trackId, eventType, riskResult, details, frameBuffer }) {
+function recordEvent({ cameraId, trackId, eventType, riskResult, details, frameBuffer, behaviorType, tamperType }) {
   const eventId = randomUUID();
   const timestamp = getISTIso();
 
@@ -165,6 +219,8 @@ function recordEvent({ cameraId, trackId, eventType, riskResult, details, frameB
     details: { ...details, explanation: riskResult.explanation, breakdown: riskResult.breakdown },
     snapshotPath,
     timestamp,
+    behaviorType,
+    tamperType,
   });
 
   broadcast('EVENT', event);
@@ -175,7 +231,43 @@ function recordEvent({ cameraId, trackId, eventType, riskResult, details, frameB
     broadcast('ALERT', alert);
   }
 
+  // Push to C2 integrations asynchronously — never blocks the pipeline
+  Promise.resolve().then(() => {
+    c2Webhook.broadcast(event);
+    mqttAdapter.publish(event);
+    takAdapter.sendCOT(event);
+  });
+
   return event;
+}
+
+/**
+ * Sends a generic priority-aware alert via email, SMS, and radio.
+ * Safe to call asynchronously — never throws.
+ */
+async function dispatchAlert(eventType, details) {
+  const timestamp = getISTTimestamp();
+  const payload = { ...details, eventType, timestamp };
+
+  // Email (via generic alert)
+  const emailResult = await sendGenericAlert(payload);
+  broadcast('GENERIC_ALERT_EMAIL', { eventType, emailSent: emailResult.sent, reason: emailResult.reason, timestamp });
+
+  // SMS (priority-aware)
+  const smsResult = await smsAlert.sendAlert({ ...details, eventType, timestamp });
+  if (smsResult.sent) {
+    console.log(`[IBVAP][SMSAlert] SMS sent for ${eventType} on ${details.cameraId}`);
+  }
+
+  // Radio tone (critical events only)
+  const radioEvents = [
+    'CAMERA_TAMPER_FREEZE', 'CAMERA_TAMPER_DARKNESS', 'CAMERA_TAMPER_OBSTRUCTED',
+    'CAMERA_TAMPER_OVEREXPOSURE', 'INBOUND_CROSSING', 'OUTBOUND_CROSSING',
+    'UNKNOWN_VEHICLE', 'BLACKLISTED_VEHICLE',
+  ];
+  if (radioEvents.includes(eventType)) {
+    radioAlert.sendAlert({ eventType, cameraId: details.cameraId, trackId: details.trackId });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +288,17 @@ const lastBroadcastFrameNumber = new Map();
 
 cameraManager.on('frame', async ({ cameraId, frameBuffer, frameNumber }) => {
   lastFrameByCamera.set(cameraId, frameBuffer);
+
+  // --- TamperDetector: run before vision engine (fast, pre-empts analysis) ---
+  const tamperDetector = tamperDetectors.get(cameraId);
+  if (tamperDetector) {
+    // Quick freeze check on every frame (no image decode needed)
+    tamperDetector.quickAnalyzeFrame(frameBuffer);
+    // Full brightness/contrast analysis every 10 frames (lightweight decode)
+    if (frameNumber % 10 === 0) {
+      tamperDetector.analyzeFrame(frameBuffer).catch(() => {});
+    }
+  }
 
   if (!enginesReady || !visionEngine.session) return;
 
@@ -232,6 +335,9 @@ cameraManager.on('frame', async ({ cameraId, frameBuffer, frameNumber }) => {
     }
 
     spatialEngine.evaluate(cameraId, tracks);
+
+    // --- BehaviorEngine: runs on every frame (lightweight trajectory math) ---
+    behaviorEngine.evaluate(cameraId, tracks, frameNumber);
 
     if (visionEngine.isAnalyticsFrame(cameraId, frameNumber)) {
       await analyticsEngine.processFrame(cameraId, frameBuffer, tracks);
@@ -416,6 +522,17 @@ analyticsEngine.on('PERSON_IDENTIFIED', (payload) => {
   });
 
   broadcast('PERSON_IDENTIFIED', payload);
+
+  // Watchlist persons trigger immediate alerts
+  if (payload.label === 'WATCHLIST_PERSON') {
+    dispatchAlert('WATCHLIST_PERSON', {
+      cameraId: payload.cameraId,
+      trackId: payload.trackId,
+      severity: riskResult.severity,
+      riskScore: riskResult.score,
+      extraInfo: ['Face matched against watchlist'],
+    });
+  }
 });
 
 analyticsEngine.on('LOITERING_DETECTED', (payload) => {
@@ -435,9 +552,102 @@ analyticsEngine.on('LOITERING_DETECTED', (payload) => {
   });
 
   broadcast('LOITERING_DETECTED', payload);
+
+  if (riskResult.severity === 'HIGH' || riskResult.severity === 'CRITICAL') {
+    dispatchAlert('LOITERING_DETECTED', {
+      cameraId: payload.cameraId,
+      trackId: payload.trackId,
+      severity: riskResult.severity,
+      riskScore: riskResult.score,
+      extraInfo: [`Dwell time: ${payload.dwellSeconds}s`],
+    });
+  }
 });
 
 analyticsEngine.on('error', (payload) => console.error(`[IBVAP][Analytics][${payload.cameraId ?? '-'}] ${payload.message}`));
+
+// --- TamperDetector: camera feed tampering alerts ---
+function registerTamperHandlers(detector) {
+  const tamperTypes = [
+    'CAMERA_TAMPER_FREEZE', 'CAMERA_TAMPER_DARKNESS',
+    'CAMERA_TAMPER_OVEREXPOSURE', 'CAMERA_TAMPER_OBSTRUCTED',
+  ];
+
+  for (const eventType of tamperTypes) {
+    detector.on(eventType, (payload) => {
+      const riskResult = RiskEngine.computeRisk({ tamperType: payload.tamperType });
+      const frameBuffer = lastFrameByCamera.get(payload.cameraId);
+      const snapshotPath = frameBuffer ? saveSnapshot(payload.cameraId, frameBuffer) : null;
+
+      recordEvent({
+        cameraId: payload.cameraId,
+        trackId: null,
+        eventType,
+        riskResult,
+        details: { tamperType: payload.tamperType, frameCount: payload.frameCount },
+        frameBuffer,
+        tamperType: payload.tamperType,
+      });
+
+      broadcast(eventType, payload);
+      dispatchAlert(eventType, {
+        cameraId: payload.cameraId,
+        severity: riskResult.severity,
+        riskScore: riskResult.score,
+        extraInfo: [`Tamper type: ${payload.tamperType}`, `Frames affected: ${payload.frameCount}`],
+      });
+    });
+  }
+}
+
+// --- BehaviorEngine: suspicious activity detection ---
+function registerBehaviorHandlers() {
+  const BEHAVIOR_EVENTS = [
+    { event: 'RUNNING_DETECTED', behavior: 'running', label: 'Running detected' },
+    { event: 'CRAWLING_DETECTED', behavior: 'crawling', label: 'Crawling/crouching detected' },
+    { event: 'CLIMBING_DETECTED', behavior: 'climbing', label: 'Climbing attempt detected' },
+    { event: 'CROWD_SURGE', behavior: 'crowdSurge', label: 'Abnormal crowd detected' },
+    { event: 'OBJECT_LEFT_BEHIND', behavior: 'objectLeftBehind', label: 'Object left behind' },
+    { event: 'SUSPICIOUS_APPEARANCE', behavior: 'suspiciousAppearance', label: 'Suspicious appearance in restricted zone' },
+  ];
+
+  for (const { event, behavior, label } of BEHAVIOR_EVENTS) {
+    behaviorEngine.on(event, (payload) => {
+      const riskResult = RiskEngine.computeRisk({
+        entityGroup: 'person',
+        behavior,
+        isNight: isNightTimeIST(),
+      });
+
+      const frameBuffer = lastFrameByCamera.get(payload.cameraId);
+
+      recordEvent({
+        cameraId: payload.cameraId,
+        trackId: payload.trackId,
+        eventType: event,
+        riskResult,
+        details: { ...payload },
+        frameBuffer,
+        behaviorType: behavior,
+      });
+
+      broadcast(event, payload);
+
+      if (riskResult.severity === 'HIGH' || riskResult.severity === 'CRITICAL') {
+        dispatchAlert(event, {
+          cameraId: payload.cameraId,
+          trackId: payload.trackId,
+          zoneName: payload.zoneName,
+          severity: riskResult.severity,
+          riskScore: riskResult.score,
+          extraInfo: [label],
+        });
+      }
+    });
+  }
+}
+
+registerBehaviorHandlers();
 
 // ---------------------------------------------------------------------------
 // REST API: Cameras
@@ -469,6 +679,11 @@ app.post('/api/cameras', (req, res) => {
   });
 
   visionEngine.setCameraConfig(cameraId, { confidenceThreshold, iouThreshold, frameStride, analyticsFrameInterval });
+
+  // Create per-camera tamper detector
+  const detector = new TamperDetector(cameraId);
+  registerTamperHandlers(detector);
+  tamperDetectors.set(cameraId, detector);
 
   try {
     cameraManager.addCamera({ cameraId, sourceType, sourceUrl, loop });
@@ -519,6 +734,8 @@ app.delete('/api/cameras/:cameraId', (req, res) => {
   visionEngine.removeCamera(cameraId);
   spatialEngine.removeCamera(cameraId);
   analyticsEngine.removeCamera(cameraId);
+  behaviorEngine.removeCamera(cameraId);
+  tamperDetectors.delete(cameraId); // stops and removes tamper detector
 
   const result = deleteCamera(cameraId); // removes the persisted DB row
   res.json({ removed: result.changes > 0 });
@@ -670,6 +887,12 @@ app.get('/api/health', (req, res) => {
     visionReady: Boolean(visionEngine.session),
     timestamp: getISTTimestamp(),
     activeCameras: cameraManager.listCameraIds(),
+    tamperDetectorsActive: tamperDetectors.size,
+    c2WebhookConfigured: c2Webhook['_urls'].length > 0,
+    mqttConnected: mqttAdapter.isConnected,
+    takEnabled: takAdapter['_enabled'],
+    smsConfigured: smsAlert['_phoneNumbers'].length > 0,
+    radioEnabled: radioAlert['_enabled'],
   });
 });
 
@@ -687,6 +910,11 @@ async function bootExistingCameras() {
         sourceUrl: camera.source_url,
       });
       spatialEngine.refreshZones(camera.camera_id);
+
+      // Re-create per-camera tamper detector
+      const detector = new TamperDetector(camera.camera_id);
+      registerTamperHandlers(detector);
+      tamperDetectors.set(camera.camera_id, detector);
       visionEngine.setCameraConfig(camera.camera_id, {
         confidenceThreshold: camera.confidence_threshold ?? undefined,
         iouThreshold: camera.iou_threshold ?? undefined,
@@ -709,6 +937,40 @@ async function start() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+async function shutdown(signal) {
+  console.log(`\n[IBVAP] ${signal} received — shutting down gracefully...`);
+
+  cameraManager.stopAll();
+
+  try {
+    await analyticsEngine.shutdown();
+  } catch (err) {
+    console.error('[IBVAP] AnalyticsEngine shutdown error:', err.message);
+  }
+
+  mqttAdapter.disconnect();
+  takAdapter.close();
+  smsAlert.close();
+  radioAlert.close();
+
+  server.close(() => {
+    console.log('[IBVAP] HTTP server closed.');
+    process.exit(0);
+  });
+
+  // Force exit after 10 seconds if graceful shutdown stalls
+  setTimeout(() => {
+    console.error('[IBVAP] Forced exit after timeout.');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('unhandledRejection', (reason) => {
   console.error('[IBVAP] Unhandled rejection (process kept alive):', reason);
 });

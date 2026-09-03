@@ -48,6 +48,8 @@ function migrateSchema() {
     'ALTER TABLE cameras ADD COLUMN frame_stride INTEGER DEFAULT 1',
     'ALTER TABLE cameras ADD COLUMN analytics_frame_interval INTEGER',
     "ALTER TABLE vehicles ADD COLUMN role TEXT DEFAULT 'UNKNOWN'",
+    "ALTER TABLE events ADD COLUMN behavior_type TEXT",
+    "ALTER TABLE events ADD COLUMN tamper_type TEXT",
   ];
   for (const sql of migrations) {
     try {
@@ -296,8 +298,8 @@ export function getFaceByCode(personCode) {
 // ---------------------------------------------------------------------------
 
 const stmtInsertEvent = db.prepare(`
-  INSERT INTO events (event_id, camera_id, track_id, event_type, severity, risk_score, details_json, snapshot_path, timestamp, created_at)
-  VALUES (@event_id, @camera_id, @track_id, @event_type, @severity, @risk_score, @details_json, @snapshot_path, @timestamp, @created_at)
+  INSERT INTO events (event_id, camera_id, track_id, event_type, severity, risk_score, details_json, snapshot_path, timestamp, created_at, behavior_type, tamper_type)
+  VALUES (@event_id, @camera_id, @track_id, @event_type, @severity, @risk_score, @details_json, @snapshot_path, @timestamp, @created_at, @behavior_type, @tamper_type)
 `);
 const stmtGetEventById = db.prepare(`SELECT * FROM events WHERE event_id = ?`);
 
@@ -314,6 +316,8 @@ export function insertEvent(event) {
     snapshot_path: event.snapshotPath ?? null,
     timestamp: event.timestamp ?? now,
     created_at: now,
+    behavior_type: event.behaviorType ?? null,
+    tamper_type: event.tamperType ?? null,
   });
   return stmtGetEventById.get(event.eventId);
 }
