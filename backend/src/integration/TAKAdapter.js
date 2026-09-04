@@ -117,8 +117,8 @@ export class TAKAdapter extends EventEmitter {
     const severity = event.severity || 'INFO';
 
     // Pixel coords as a stand-in; in production these would be geo-coords
-    const px = event.groundPoint?.[0] ?? 0;
-    const py = event.groundPoint?.[1] ?? 0;
+    const px = event.details?.groundPoint?.[0] ?? 0;
+    const py = event.details?.groundPoint?.[1] ?? 1;
 
     // Simplified lat/lon from pixel coords for demo — would come from camera calibration in production
     const lat = 28.6139 + (py / 10000); // placeholder geo mapping
@@ -129,8 +129,8 @@ export class TAKAdapter extends EventEmitter {
 
     const riskScore = event.risk_score ?? event.riskScore ?? 0;
     const detailLines = [];
-    if (event.explanation && Array.isArray(event.explanation)) {
-      detailLines.push(...event.explanation);
+    if (event.details?.explanation && Array.isArray(event.details.explanation)) {
+      detailLines.push(...event.details.explanation);
     }
     if (severity) detailLines.push(`Severity: ${severity}`);
     if (riskScore) detailLines.push(`Risk: ${riskScore}/100`);

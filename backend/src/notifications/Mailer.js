@@ -59,6 +59,9 @@ function getAlertPriority(eventType) {
 // frame across many analytics-eligible frames doesn't flood the inbox.
 const ALERT_COOLDOWN_MS = Number.parseInt(process.env.ALERT_EMAIL_COOLDOWN_MS ?? '300000', 10); // default 5 minutes
 
+// Tamper alerts get their own cooldown window (separate from vehicle/zone alerts)
+const TAMPER_COOLDOWN_MS = Number.parseInt(process.env.ALERT_TAMPER_COOLDOWN_MS ?? '60000', 10); // default 1 minute
+
 // ============================================================
 // Implementation — shouldn't need to touch below this line
 // ============================================================
@@ -229,8 +232,10 @@ export async function sendGenericAlert(details) {
     ? `${details.eventType}:${details.cameraId}:${details.trackId || 'no-track'}`
     : `${details.cameraId}:${details.trackId || 'no-track'}`;
 
-  // Tamper events have no cooldown — always send immediately
-  const cooldown = details.eventType?.startsWith('CAMERA_TAMPER') ? 0 : ALERT_COOLDOWN_MS;
+  // Tamper events get a tamper-specific cooldown instead of the general cooldown
+  const cooldown = details.eventType?.startsWith('CAMERA_TAMPER')
+    ? TAMPER_COOLDOWN_MS
+    : ALERT_COOLDOWN_MS;
   if (cooldown > 0 && isOnCooldown(cooldownKey)) {
     return { sent: false, reason: 'cooldown' };
   }

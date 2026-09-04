@@ -360,13 +360,16 @@ export class BehaviorEngine extends EventEmitter {
   }
 
   _checkObjectLeftBehind(cameraId, personTracks, vehicleTracks, frameNumber) {
-    // Simple approach: track which vehicle/person tracks are stationary,
-    // and which person tracks disappeared near them.
-
-    const allTracks = [...vehicleTracks, ...personTracks];
+    // Build the full track list: vehicles (from param 2) then persons (from param 1).
+    // The call site passes (personTracks, vehicleTracks), so:
+    //   - param 1 "personTracks"  = actual vehicle tracks array
+    //   - param 2 "vehicleTracks" = actual person tracks array
+    // Fix: swap the concatenation order so allTracks = [actual vehicles, actual persons].
+    const allTracks = [...personTracks, ...vehicleTracks];
     const allIds = new Set(allTracks.map((t) => t.id));
 
-    for (const track of vehicleTracks) {
+    // Fix: iterate over actual vehicle tracks (param 1 "personTracks" = vehicles)
+    for (const track of personTracks) {
       if (!this._stationaryObjects) this._stationaryObjects = new Map();
       if (!this._stationaryObjects.has(cameraId)) this._stationaryObjects.set(cameraId, new Map());
 
@@ -378,10 +381,12 @@ export class BehaviorEngine extends EventEmitter {
 
       const entry = camStationary.get(track.id);
 
-      // Compute velocity from ground point history
-      if (this._trackVelocity && this._trackVelocity.has(`${cameraId}:${track.id}`)) {
-        const vel = this._trackVelocity.get(`${cameraId}:${track.id}`);
-        if (vel < OBJECT_LEFT_STATIONARY_VELOCITY) {
+      // Compute velocity from per-track state (stored in _trackStates, populated by _updateState)
+      const trackState = this._trackStates.get(cameraId)?.get(track.id);
+      if (trackState && trackState.velocityHistory && trackState.velocityHistory.length > 0) {
+        const recentVels = trackState.velocityHistory.slice(-3);
+        const avgVel = recentVels.reduce((a, b) => a + b, 0) / recentVels.length;
+        if (avgVel < OBJECT_LEFT_STATIONARY_VELOCITY) {
           entry.stationaryFrames = (entry.stationaryFrames || 0) + 1;
         } else {
           entry.stationaryFrames = 0;
@@ -410,10 +415,10 @@ export class BehaviorEngine extends EventEmitter {
         }
       }
 
-      // Update nearby person
+      // Update nearby person — iterate over actual person tracks (param 2 "vehicleTracks" = persons)
       let closestPerson = null;
       let closestDist = Infinity;
-      for (const person of personTracks) {
+      for (const person of vehicleTracks) {
         const dist = Math.hypot(
           person.groundPoint[0] - track.groundPoint[0],
           person.groundPoint[1] - track.groundPoint[1],
@@ -428,9 +433,6 @@ export class BehaviorEngine extends EventEmitter {
         entry.lastPersonNearby = { trackId: closestPerson.id, dist: closestDist };
       }
     }
-
-    // Track velocity for all tracks
-    if (!this._trackVelocity) this._trackVelocity = new Map();
   }
 
   // -------------------------------------------------------------------------

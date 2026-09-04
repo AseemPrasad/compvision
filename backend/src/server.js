@@ -849,7 +849,7 @@ app.post('/api/vehicles', (req, res) => {
 // ---------------------------------------------------------------------------
 
 app.get('/api/events', (req, res) => {
-  const { cameraId, eventType, severity, from, to, limit, offset } = req.query;
+  const { cameraId, eventType, severity, from, to, limit, offset, behaviorType, tamperType } = req.query;
   const events = searchEvents({
     cameraId,
     eventType,
@@ -858,6 +858,8 @@ app.get('/api/events', (req, res) => {
     to,
     limit: limit ? Number.parseInt(limit, 10) : undefined,
     offset: offset ? Number.parseInt(offset, 10) : undefined,
+    behaviorType: behaviorType || undefined,
+    tamperType: tamperType || undefined,
   });
   res.json({ events });
 });

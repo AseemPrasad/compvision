@@ -46,8 +46,8 @@ export class C2Webhook {
       geometry: {
         type: 'Point',
         coordinates: [
-          event.groundPoint?.[0] ?? 0,
-          event.groundPoint?.[1] ?? 0,
+          event.details?.groundPoint?.[0] ?? 0,
+          event.details?.groundPoint?.[1] ?? 0,
         ],
       },
       properties: {

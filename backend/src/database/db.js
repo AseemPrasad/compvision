@@ -350,6 +350,14 @@ export function searchEvents(filters = {}) {
     clauses.push('timestamp <= @to');
     params.to = filters.to;
   }
+  if (filters.behaviorType) {
+    clauses.push('behavior_type = @behaviorType');
+    params.behaviorType = filters.behaviorType;
+  }
+  if (filters.tamperType) {
+    clauses.push('tamper_type = @tamperType');
+    params.tamperType = filters.tamperType;
+  }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const limit = Number.isInteger(filters.limit) ? filters.limit : 100;
