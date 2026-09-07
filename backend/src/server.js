@@ -286,23 +286,30 @@ const lastFrameByCamera = new Map();
 const FRAME_BROADCAST_INTERVAL = Number.parseInt(process.env.FRAME_BROADCAST_INTERVAL ?? '2', 10);
 const lastBroadcastFrameNumber = new Map();
 
+const processingByCamera = new Set();
+
 cameraManager.on('frame', async ({ cameraId, frameBuffer, frameNumber }) => {
   lastFrameByCamera.set(cameraId, frameBuffer);
 
-  // --- TamperDetector: run before vision engine (fast, pre-empts analysis) ---
-  const tamperDetector = tamperDetectors.get(cameraId);
-  if (tamperDetector) {
-    // Quick freeze check on every frame (no image decode needed)
-    tamperDetector.quickAnalyzeFrame(frameBuffer);
-    // Full brightness/contrast analysis every 10 frames (lightweight decode)
-    if (frameNumber % 10 === 0) {
-      tamperDetector.analyzeFrame(frameBuffer).catch(() => {});
-    }
-  }
-
-  if (!enginesReady || !visionEngine.session) return;
+  // Frame-dropping backpressure guard: if this camera is already processing an
+  // inference frame, drop the incoming frame so the event loop never locks up.
+  if (processingByCamera.has(cameraId)) return;
+  processingByCamera.add(cameraId);
 
   try {
+    // --- TamperDetector: run before vision engine (fast, pre-empts analysis) ---
+    const tamperDetector = tamperDetectors.get(cameraId);
+    if (tamperDetector) {
+      // Quick freeze check on every frame (no image decode needed)
+      tamperDetector.quickAnalyzeFrame(frameBuffer);
+      // Full brightness/contrast analysis every 10 frames (lightweight decode)
+      if (frameNumber % 10 === 0) {
+        tamperDetector.analyzeFrame(frameBuffer).catch(() => {});
+      }
+    }
+
+    if (!enginesReady || !visionEngine.session) return;
+
     const tracks = await visionEngine.processFrame(cameraId, frameBuffer, frameNumber);
 
     // Broadcast lightweight live telemetry every frame regardless of
@@ -344,6 +351,8 @@ cameraManager.on('frame', async ({ cameraId, frameBuffer, frameNumber }) => {
     }
   } catch (err) {
     console.error(`[IBVAP] Pipeline error for ${cameraId}:`, err.message);
+  } finally {
+    processingByCamera.delete(cameraId);
   }
 });
 

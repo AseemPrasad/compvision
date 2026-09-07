@@ -11,7 +11,7 @@
     "seed:vehicles": "node src/scripts/seedVehicles.js"
   },
   "dependencies": {
-    "@tensorflow/tfjs-node": "^4.22.0",
+    "@tensorflow/tfjs": "^4.22.0",
     "@turf/turf": "^7.2.0",
     "@vladmandic/face-api": "^1.7.12",
     "better-sqlite3": "^11.8.0",

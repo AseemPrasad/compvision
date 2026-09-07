@@ -115,8 +115,11 @@ class CameraStream {
       // modern ffmpeg (confirmed failing on ffmpeg 8.1.2).
       opts.push('-timeout', '5000000'); // 5s socket timeout (microseconds)
     }
-    if (this.sourceType === 'MP4' && this.loop) {
-      opts.push('-stream_loop', '-1');
+    if (this.sourceType === 'MP4') {
+      opts.push('-re'); // Read input at native framerate (real-time stream)
+      if (this.loop) {
+        opts.push('-stream_loop', '-1');
+      }
     }
     return opts;
   }

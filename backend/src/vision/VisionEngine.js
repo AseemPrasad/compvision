@@ -171,7 +171,7 @@ export class VisionEngine extends EventEmitter {
     try {
       this.session = await ort.InferenceSession.create(this.modelPath, {
         executionProviders: ['cpu'],
-        graphOptimizationLevel: 'all',
+        graphOptimizationLevel: 'basic',
       });
       this._ready = true;
       this.emit('ready', {});
