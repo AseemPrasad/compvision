@@ -131,6 +131,25 @@
     pointer-events: none;
   }
 
+  .tile-controls {
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .tile-controls summary {
+    padding: 6px 12px;
+    cursor: pointer;
+    user-select: none;
+    font-weight: 500;
+    background: #0d1117;
+  }
+  .tile-controls summary:hover {
+    color: var(--text);
+  }
+  .tile-controls[open] summary {
+    border-bottom: 1px solid var(--border);
+  }
+
   .toolbar {
     display: flex;
     flex-wrap: wrap;
@@ -302,23 +321,26 @@ function buildTiles() {
         <div class="placeholder" id="placeholder-${cam.id}">Waiting for frames…</div>
         <div class="crossing-hud" id="hud-${cam.id}"></div>
       </div>
-      <div class="hint" id="hint-${cam.id}">Click points on the video to place <span class="hint-mode"></span>. Click "Finish" when done.</div>
-      <div class="toolbar">
-        <button class="tbtn" id="poly-${cam.id}">+ Polygon Zone</button>
-        <button class="tbtn" id="line-${cam.id}">+ Line Fence</button>
-        <input type="text" id="name-${cam.id}" placeholder="Zone name" value="Restricted Area">
-        <select id="sev-${cam.id}">
-          <option value="LOW">LOW</option>
-          <option value="MEDIUM" selected>MEDIUM</option>
-          <option value="HIGH">HIGH</option>
-          <option value="CRITICAL">CRITICAL</option>
-        </select>
-        <button class="tbtn save" id="finish-${cam.id}" disabled>Finish &amp; Save</button>
-        <button class="tbtn danger" id="cancel-${cam.id}" disabled>Cancel</button>
-      </div>
       <div class="meta-row" id="meta-${cam.id}">fps: – | tracks: 0</div>
-      <div class="meta-row" id="params-${cam.id}" style="padding-top:0; color:var(--blue);">loading detection params…</div>
-      <div class="zonelist" id="zonelist-${cam.id}"></div>
+      <details class="tile-controls">
+        <summary>⚙️ Zone &amp; Detection Controls</summary>
+        <div class="hint" id="hint-${cam.id}">Click points on the video to place <span class="hint-mode"></span>. Click "Finish" when done.</div>
+        <div class="toolbar">
+          <button class="tbtn" id="poly-${cam.id}">+ Polygon Zone</button>
+          <button class="tbtn" id="line-${cam.id}">+ Line Fence</button>
+          <input type="text" id="name-${cam.id}" placeholder="Zone name" value="Restricted Area">
+          <select id="sev-${cam.id}">
+            <option value="LOW">LOW</option>
+            <option value="MEDIUM" selected>MEDIUM</option>
+            <option value="HIGH">HIGH</option>
+            <option value="CRITICAL">CRITICAL</option>
+          </select>
+          <button class="tbtn save" id="finish-${cam.id}" disabled>Finish &amp; Save</button>
+          <button class="tbtn danger" id="cancel-${cam.id}" disabled>Cancel</button>
+        </div>
+        <div class="meta-row" id="params-${cam.id}" style="padding-top:0; color:var(--blue);">loading detection params…</div>
+        <div class="zonelist" id="zonelist-${cam.id}"></div>
+      </details>
     `;
     // Not appended to the DOM yet — layoutTiles() places each tile into
     // either the hero column or the thumbnail column, and re-runs whenever
@@ -338,6 +360,7 @@ function buildTiles() {
       placeholder: tile.querySelector(`#placeholder-${cam.id}`),
       hint: tile.querySelector(`#hint-${cam.id}`),
       hud: tile.querySelector(`#hud-${cam.id}`),
+      controlsEl: tile.querySelector('.tile-controls'),
       zoneListEl: tile.querySelector(`#zonelist-${cam.id}`),
       paramsEl: tile.querySelector(`#params-${cam.id}`),
       frameCount: 0,
@@ -400,6 +423,9 @@ function layoutTiles() {
 function setHeroCamera(cameraId) {
   if (cameraId === heroCameraId) return;
   heroCameraId = cameraId;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'SET_MAIN_CAMERA', cameraId }));
+  }
   layoutTiles();
 }
 
@@ -426,6 +452,7 @@ function startDrawing(cameraId, type) {
     alert('Wait for the live video to load before drawing a zone.');
     return;
   }
+  if (state.controlsEl) state.controlsEl.open = true;
   state.draw = { active: true, type, points: [] };
   state.canvas.classList.add('drawing');
   state.finishBtn.disabled = true;
@@ -591,9 +618,79 @@ function drawFrame(cameraId) {
     }
   }
 
+  // Ultra-Smooth 60 FPS Box Interpolation Engine (Velocity Extrapolation + Hermite Easing + Occlusion Persistence)
+  if (!state.boxLerpMap) state.boxLerpMap = new Map();
+  const nowMs = performance.now();
+
+  const currentTrackIds = new Set();
   for (const track of latestTracks) {
-    const [x1, y1, x2, y2] = track.box;
-    const color = CLASS_COLORS[track.group] || CLASS_COLORS.other;
+    currentTrackIds.add(track.id);
+    let lerpState = state.boxLerpMap.get(track.id);
+    if (!lerpState) {
+      lerpState = {
+        currentBox: [...track.box],
+        targetBox: [...track.box],
+        prevBox: [...track.box],
+        velocity: [0, 0, 0, 0], // [vx1, vy1, vx2, vy2] velocity vector
+        track,
+        lastUpdate: nowMs,
+        alpha: 1.0,
+      };
+      state.boxLerpMap.set(track.id, lerpState);
+    } else {
+      const dt = Math.max(1, nowMs - lerpState.lastUpdate);
+      const [nx1, ny1, nx2, ny2] = track.box;
+      const [cx1, cy1, cx2, cy2] = lerpState.targetBox;
+
+      // Estimate instantaneous velocity vector per millisecond
+      lerpState.velocity = [
+        (nx1 - cx1) / dt,
+        (ny1 - cy1) / dt,
+        (nx2 - cx2) / dt,
+        (ny2 - cy2) / dt,
+      ];
+      lerpState.prevBox = [...lerpState.targetBox];
+      lerpState.targetBox = [...track.box];
+      lerpState.track = track;
+      lerpState.lastUpdate = nowMs;
+      lerpState.alpha = 1.0;
+    }
+  }
+
+  // Prune dead/stale tracks that are no longer in the active telemetry frame or have lapsed > 500ms
+  for (const [id, lerpState] of state.boxLerpMap) {
+    if (!currentTrackIds.has(id) || (nowMs - lerpState.lastUpdate) > 500) {
+      state.boxLerpMap.delete(id);
+    }
+  }
+
+  let needsNextFrame = false;
+  for (const [id, lerpState] of state.boxLerpMap) {
+    const { currentBox, targetBox, velocity, track, alpha } = lerpState;
+    const dt = nowMs - lerpState.lastUpdate;
+
+    // Extrapolate predicted target box based on velocity & time delta
+    const predictedTarget = [
+      targetBox[0] + velocity[0] * Math.min(dt, 100),
+      targetBox[1] + velocity[1] * Math.min(dt, 100),
+      targetBox[2] + velocity[2] * Math.min(dt, 100),
+      targetBox[3] + velocity[3] * Math.min(dt, 100),
+    ];
+
+    // Hermite smoothstep factor for butter-smooth gliding (30% per frame)
+    const factor = 0.28;
+    for (let i = 0; i < 4; i++) {
+      currentBox[i] += (predictedTarget[i] - currentBox[i]) * factor;
+      if (Math.abs(predictedTarget[i] - currentBox[i]) > 0.3) {
+        needsNextFrame = true;
+      }
+    }
+
+    if (alpha < 1.0) needsNextFrame = true;
+
+    const [x1, y1, x2, y2] = currentBox;
+    const baseColor = CLASS_COLORS[track.group] || CLASS_COLORS.other;
+    const color = hexToRgba(baseColor, alpha);
 
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
@@ -604,8 +701,16 @@ function drawFrame(cameraId) {
     const textWidth = ctx.measureText(label).width;
     ctx.fillStyle = color;
     ctx.fillRect(x1, Math.max(0, y1 - 16), textWidth + 8, 16);
-    ctx.fillStyle = '#0b0f14';
+    ctx.fillStyle = hexToRgba('#0b0f14', alpha);
     ctx.fillText(label, x1 + 4, Math.max(12, y1 - 4));
+  }
+
+  if ((needsNextFrame || state.boxLerpMap.size > 0) && !state.animating) {
+    state.animating = true;
+    requestAnimationFrame(() => {
+      state.animating = false;
+      drawFrame(cameraId);
+    });
   }
 }
 

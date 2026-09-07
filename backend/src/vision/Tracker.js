@@ -107,7 +107,7 @@ export class Tracker {
    * @param {number} [opts.iouThreshold]
    */
   constructor(opts = {}) {
-    this.maxAge = opts.maxAge ?? 20;
+    this.maxAge = opts.maxAge ?? 5; // Reduced from 20 to 5 to immediately drop phantom boxes when subjects exit
     this.iouThreshold = opts.iouThreshold ?? IOU_MATCH_THRESHOLD;
     /** @type {Map<string, Track>} */
     this.tracks = new Map();
@@ -227,16 +227,18 @@ export class Tracker {
   }
 
   getActiveTracks() {
-    return Array.from(this.tracks.values()).map((t) => ({
-      id: t.id,
-      group: t.group,
-      className: t.className,
-      box: t.box,
-      confidence: t.confidence,
-      groundPoint: t.groundPoint,
-      age: t.age,
-      hits: t.hits,
-    }));
+    return Array.from(this.tracks.values())
+      .filter((t) => t.age === 0) // Only emit tracks actively detected in the current frame (no ghost boxes)
+      .map((t) => ({
+        id: t.id,
+        group: t.group,
+        className: t.className,
+        box: t.box,
+        confidence: t.confidence,
+        groundPoint: t.groundPoint,
+        age: t.age,
+        hits: t.hits,
+      }));
   }
 
   reset() {

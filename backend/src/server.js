@@ -107,6 +107,16 @@ wss.on('connection', (ws) => {
     ts: getISTTimestamp(),
   }));
 
+  ws.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+      if (data.type === 'SET_MAIN_CAMERA' && data.cameraId) {
+        activePriorityCameraId = data.cameraId;
+        console.log(`[IBVAP] Priority inference switched to MAIN camera: ${data.cameraId}`);
+      }
+    } catch {}
+  });
+
   ws.on('error', () => {
     // Ignore — a broken client socket should never affect the server process.
   });
@@ -277,23 +287,25 @@ async function dispatchAlert(eventType, details) {
 // Cache of the most recent frame buffer per camera, so async spatial/risk
 // event handlers (which fire slightly after the triggering `frame` event)
 // can still attach a snapshot without re-plumbing the buffer through every
-// intermediate emitter.
-const lastFrameByCamera = new Map();
+// Track active MAIN camera priority (defaults to CAM-001)
+let activePriorityCameraId = 'CAM-001';
 
-// Throttles live JPEG preview broadcasting independently per camera, since
-// sending a base64 frame on every single tick would flood the WebSocket
-// with far more bandwidth than the live viewer actually needs.
+const lastFrameByCamera = new Map();
 const FRAME_BROADCAST_INTERVAL = Number.parseInt(process.env.FRAME_BROADCAST_INTERVAL ?? '2', 10);
 const lastBroadcastFrameNumber = new Map();
-
 const processingByCamera = new Set();
 
 cameraManager.on('frame', async ({ cameraId, frameBuffer, frameNumber }) => {
   lastFrameByCamera.set(cameraId, frameBuffer);
 
-  // Frame-dropping backpressure guard: if this camera is already processing an
-  // inference frame, drop the incoming frame so the event loop never locks up.
-  if (processingByCamera.has(cameraId)) return;
+  // Priority scheduling: if MAIN camera, always attempt immediate inference.
+  // For background cameras, if CPU is busy or frame stride matches, drop backpressure.
+  const isMainCamera = (cameraId === activePriorityCameraId);
+  if (!isMainCamera && processingByCamera.has(cameraId)) return;
+  
+  // If CPU is currently busy with ANY camera, give absolute priority to MAIN camera
+  if (!isMainCamera && processingByCamera.size > 0) return;
+
   processingByCamera.add(cameraId);
 
   try {
