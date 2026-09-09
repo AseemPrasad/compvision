@@ -1,0 +1,44 @@
+# ==============================================================================
+# IBVAP (Intelligent Border Video Analytics Platform) - Dependencies & Setup
+# Node.js Project (Equivalent to Python requirements.txt)
+# ==============================================================================
+
+# System Prerequisites (Must be installed on OS)
+# ------------------------------------------------------------------------------
+# 1. Node.js v18.0.0 or higher (v22 recommended)
+# 2. ffmpeg (Required for video decoding & RTSP/MP4 ingestion)
+
+# Core AI / Computer Vision / ML Dependencies
+# ------------------------------------------------------------------------------
+onnxruntime-node>=1.20.1    # ONNX Runtime engine for CPU YOLO11 object detection
+@tensorflow/tfjs>=4.22.0     # TensorFlow.js core runtime for face recognition
+@vladmandic/face-api>=1.7.12 # Face detection & embedding model architecture
+tesseract.js>=6.0.0         # Automatic Number Plate Recognition (ANPR) OCR engine
+canvas>=3.0.0-rc2           # Canvas graphics API for crop processing & frame letterboxing
+
+# Geospatial & Analytics
+# ------------------------------------------------------------------------------
+@turf/turf>=7.2.0           # Spatial math, polygon virtual fencing, & line crossing math
+
+# Database & Backend Framework
+# ------------------------------------------------------------------------------
+express>=4.21.2             # REST API HTTP web server
+better-sqlite3>=11.8.0      # High-performance SQLite database engine with WAL support
+ws>=8.18.0                  # WebSocket server for real-time 60 FPS video telemetry
+cors>=2.8.5                 # Cross-Origin Resource Sharing middleware
+dotenv>=16.4.7              # Environment variable loader (.env)
+uuid>=11.0.5                # UUID generator for transaction & tracking IDs
+luxon>=3.5.0                # Timezone & IST datetime formatting library
+
+# Notifications & Alerting
+# ------------------------------------------------------------------------------
+nodemailer>=6.9.16          # SMTP Email alert dispatcher
+
+# Development Tools
+# ------------------------------------------------------------------------------
+nodemon>=3.1.9              # Auto-reloader daemon for server development
+
+# ==============================================================================
+# Quick Installation Command:
+#   npm install
+# ==============================================================================
